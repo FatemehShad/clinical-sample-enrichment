@@ -2,13 +2,14 @@
 ## Reactome via Graphite
 See [here](https://bioconductor.org/packages/devel/bioc/vignettes/graphite/inst/doc/graphite.pdf)
 
-## Starting Reacome in Docker
+## Reactome via Neo4J
+### Starting Reacome in Docker
 To start Reactome in Neo4J in Docker:
  ```bash
  docker run -p 7474:7474 -p 7687:7687 -e NEO4J_dbms_memory_heap_maxSize=8g reactome/graphdb:latest
  ```
 
-## Some queries for Reactome
+### Some queries for Reactome
 * Find the number of nodes:
 ```cypher
 MATCH(n) RETURN count(n) AS node_count
