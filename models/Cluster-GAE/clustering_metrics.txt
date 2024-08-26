@@ -1,0 +1,13 @@
+Model: models\Cluster-GAE\model_state_dict_out_channels_64_hidden_60_layers_6_dropout_0.2.pth
+KMeans Silhouette Score: 0.5764636397361755
+KMeans Calinski-Harabasz Score: 1794.485624945195
+KMeans Davies-Bouldin Score: 0.7703903763091003
+Agglomerative Silhouette Score: 0.5613025426864624
+Agglomerative Calinski-Harabasz Score: 1569.9302794302469
+Agglomerative Davies-Bouldin Score: 0.7061847324496192
+KMedoids Silhouette Score: None
+KMedoids Calinski-Harabasz Score: None
+KMedoids Davies-Bouldin Score: None
+Mutual Information Score (KMeans-Agglomerative): 0.7145689439972378
+Mutual Information Score (KMeans-KMedoids): 0.8468081020989323
+Mutual Information Score (Agglomerative-KMedoids): 0.7171400522523568
