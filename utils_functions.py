@@ -26,6 +26,9 @@ from sklearn_extra.cluster import KMedoids
 from scipy.linalg import norm
 import math
 import textwrap
+from pathlib import Path
+
+DEFAULT_GRAPH = Path(__file__).resolve().parent / "data" / "combined_graph_latest.pkl"
 from matplotlib_venn import venn2
 
 def get_protein_indices_in_pyg(graph, existing_proteins_list):
@@ -68,7 +71,7 @@ def get_protein_indices_in_pyg(graph, existing_proteins_list):
     return protein_indices_in_pyg
 
 
-def map_tensor_indices_to_names(indices, pipeline, graph_path='combined_graph_latest.pkl'):
+def map_tensor_indices_to_names(indices, pipeline, graph_path=DEFAULT_GRAPH):
     # Load the graph
     graph = pipeline.load_graph_from_pickle(graph_path)
     
@@ -93,7 +96,7 @@ def map_tensor_indices_to_names(indices, pipeline, graph_path='combined_graph_la
     return names
 
 
-def map_names_to_tensor_indices(names, pipeline, existing_proteins_list, graph_path='combined_graph_latest.pkl'):
+def map_names_to_tensor_indices(names, pipeline, existing_proteins_list, graph_path=DEFAULT_GRAPH):
     # Load the graph
     graph = pipeline.load_graph_from_pickle(graph_path)
     
@@ -149,7 +152,7 @@ def select_features_and_predict(train_data_path, target, processed_proteins, num
     features = train.columns.tolist()
     features.remove(target)
     matched_set = processed_proteins.intersection(features)
-    features = list(matched_set)
+    features = sorted(matched_set)
     print("Matched items:", len(features))
 
     best = []
@@ -160,7 +163,7 @@ def select_features_and_predict(train_data_path, target, processed_proteins, num
     # Feature selection loop
     while len(best) < num_best_features:
         max_acc = 0
-        remaining_features = list(set(features) - set(best))
+        remaining_features = sorted(set(features) - set(best))
         for new_column in remaining_features:
             accuracies = []
             for train_index, test_index in loo.split(train):
@@ -194,7 +197,7 @@ def calculate_similarity_matrix(embeddings):
     return similarity_matrix
 
 def calculate_mutual_info_score(labels1, labels2):
-    mi_score = mutual_info_score(labels1, labels2)
+    return mutual_info_score(labels1, labels2)
 
 def create_directories(directories):
     for directory in directories:
@@ -229,13 +232,13 @@ def generate_embeddings_from_models(parent_dir, graph_data, pipeline):
 
 
 
-def perform_enrichment_analysis(protein_clusters, pipeline, n_clusters, output_dir, clustering_method, organism='mmusculus', top_n=10):
+def perform_enrichment_analysis(protein_clusters, pipeline, n_clusters, output_dir, clustering_method, organism='mmusculus', top_n=10, graph_path=DEFAULT_GRAPH):
     gp_client = gp.GProfiler(return_dataframe=True)
     enrichment_results = []
     
     for cluster_id in range(n_clusters):
         proteins_in_cluster = protein_clusters[protein_clusters['Cluster'] == cluster_id]['ProteinID'].tolist()
-        prot_names = map_tensor_indices_to_names(proteins_in_cluster, pipeline)
+        prot_names = map_tensor_indices_to_names(proteins_in_cluster, pipeline, graph_path)
         
         if not prot_names:
             continue
@@ -422,7 +425,7 @@ def plot_clustering_scores(protein_embedding, model_result_dir, model_name):
     cluster_range = range(2, 11)
     
     for n_clusters in cluster_range:
-        kmeans = KMeans(n_clusters=n_clusters, random_state=2)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=2, n_init=10)
         kmeans_labels = kmeans.fit_predict(protein_embedding)
         silhouette_scores['KMeans'].append(silhouette_score(protein_embedding, kmeans_labels))
         calinski_scores['KMeans'].append(calinski_harabasz_score(protein_embedding, kmeans_labels))
@@ -472,7 +475,7 @@ def plot_clustering_scores(protein_embedding, model_result_dir, model_name):
 
 
 
-def evaluate_embeddings(models, n_clusters, protein_indices_in_pyg, pipeline, clustering_algorithm):
+def evaluate_embeddings(models, n_clusters, protein_indices_in_pyg, pipeline, clustering_algorithm, graph_path=DEFAULT_GRAPH):
     metrics = []
     embeddings_list = []
     model_names = []
@@ -488,13 +491,13 @@ def evaluate_embeddings(models, n_clusters, protein_indices_in_pyg, pipeline, cl
         embeddings_list.append(protein_embedding_normalized)
         print(protein_embedding_normalized.shape)
         plot_clustering_scores(protein_embedding_normalized, model_result_dir, file_name)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=2)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=2, n_init=10)
         kmeans_labels = kmeans.fit_predict(protein_embedding_normalized)
 
         agglo = AgglomerativeClustering(n_clusters=n_clusters)
         agglo_labels = agglo.fit_predict(protein_embedding_normalized)
 
-        kmedoids = KMedoids(n_clusters=n_clusters)
+        kmedoids = KMedoids(n_clusters=n_clusters, random_state=2)
         kmedoids_labels = kmedoids.fit_predict(protein_embedding_normalized)
 
         mutual_info_kmeans_agglo = mutual_info_score(kmeans_labels, agglo_labels)
@@ -505,8 +508,8 @@ def evaluate_embeddings(models, n_clusters, protein_indices_in_pyg, pipeline, cl
         protein_clusters_agglo = pd.DataFrame({'ProteinID': protein_indices_in_pyg, 'Cluster': agglo_labels})
         # protein_clusters_kmedoids = pd.DataFrame({'ProteinID': protein_indices_in_pyg, 'Cluster': kmedoids_labels})
 
-        perform_enrichment_analysis(protein_clusters_kmeans, pipeline, n_clusters, model_result_dir, 'kmeans')
-        perform_enrichment_analysis(protein_clusters_agglo, pipeline, n_clusters, model_result_dir, 'agglomerative')
+        perform_enrichment_analysis(protein_clusters_kmeans, pipeline, n_clusters, model_result_dir, 'kmeans', graph_path=graph_path)
+        perform_enrichment_analysis(protein_clusters_agglo, pipeline, n_clusters, model_result_dir, 'agglomerative', graph_path=graph_path)
         # perform_enrichment_analysis(protein_clusters_kmedoids, pipeline, n_clusters, model_result_dir, 'kmedoids')
 
         silhouette_kmeans = silhouette_score(protein_embedding_normalized, kmeans_labels)

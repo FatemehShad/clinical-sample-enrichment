@@ -1,4 +1,10 @@
 import os
+import argparse
+import json
+import hashlib
+import platform
+from importlib.metadata import version
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
@@ -12,6 +18,20 @@ from torch_geometric.data import Batch
 import networkx as nx
 import random
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_GRAPH = REPO_ROOT / 'data' / 'combined_graph_latest.pkl'
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+
 
 class GCNEncoder(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout_rate):
@@ -42,9 +62,12 @@ class GCNEncoder(torch.nn.Module):
         return x
 
 class GAEPipeline:
-    def __init__(self, in_channels, out_channels, hidden_channels, num_layers, dropout_rate, sampling_method='method1', preprocessing=True, **sampling_params):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, in_channels, out_channels, hidden_channels, num_layers, dropout_rate, sampling_method='random_walk', preprocessing=True, seed=42, output_dir=None, device=None, feature_keys=None, **sampling_params):
+        self.seed = seed
+        seed_everything(seed)
+        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.in_channels = in_channels
+        self.feature_keys = list(feature_keys) if feature_keys is not None else None
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
@@ -52,11 +75,11 @@ class GAEPipeline:
         self.sampling_method_name = sampling_method
         self.sampling_method = self._get_sampling_method(sampling_method)
         self.preprocessing = preprocessing
-        self.sampling_params = sampling_params
+        self.sampling_params = dict(sampling_params)
 
         # Create a directory name string that includes all relevant parameters
         params_str = '_'.join([f'{k}_{v}' for k, v in sampling_params.items()])
-        self.directory = f"latest_models_normalize/{self.sampling_method_name}_out_{out_channels}_hidden_{hidden_channels}_layers_{num_layers}_dropout_{dropout_rate}_{params_str}"
+        self.directory = str(Path(output_dir or REPO_ROOT / "outputs") / f"{self.sampling_method_name}_out_{out_channels}_hidden_{hidden_channels}_layers_{num_layers}_dropout_{dropout_rate}_seed_{seed}_{params_str}")
         
         # Create directories based on hyperparameters
         os.makedirs(self.directory, exist_ok=True)
@@ -70,7 +93,11 @@ class GAEPipeline:
         loss = F.binary_cross_entropy(predicted_adj, true_adj)
         return loss
 
-    def load_graph_from_pickle(self, file_path):
+    def load_graph_from_pickle(self, file_path=DEFAULT_GRAPH):
+        file_path = Path(file_path)
+        if not file_path.is_absolute() and not file_path.exists():
+            candidate = REPO_ROOT / file_path
+            file_path = candidate if candidate.exists() else REPO_ROOT / 'data' / file_path
         with open(file_path, 'rb') as f:
             return pickle.load(f)
 
@@ -80,7 +107,9 @@ class GAEPipeline:
 
     def _get_sampling_method(self, method_name):
         """Dynamically selects the sampling method."""
-        if method_name == 'random_walk':
+        if method_name == 'none':
+            return None
+        elif method_name == 'random_walk':
             return self.random_walk
         elif method_name == 'forest_fire':
             return self.forest_fire
@@ -95,7 +124,7 @@ class GAEPipeline:
         return graph_int_labels
 
     def custom_collate(self, batch):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = self.device
         batch = Batch.from_data_list(batch)
         batch.to(device)
         return batch
@@ -104,8 +133,9 @@ class GAEPipeline:
         processed_features = []
         for feature in features:
             try:
-                processed_features.append(float(feature))
-            except ValueError:
+                value = float(feature)
+                processed_features.append(value if np.isfinite(value) else 0.0)
+            except (ValueError, TypeError):
                 processed_features.append(0.0)  # Using 0.0 as a placeholder
         # Pad features to the max length
         if len(processed_features) < max_length:
@@ -122,14 +152,20 @@ class GAEPipeline:
 
     def from_networkx_to_torch_geometric(self, G):
         mapping = {k: i for i, k in enumerate(G.nodes())}
-        edges = torch.tensor([list(map(mapping.get, edge)) for edge in G.edges()], dtype=torch.long).t().contiguous()
+        if not G.number_of_nodes():
+            raise ValueError('Cannot train on an empty graph')
+        edge_pairs = [list(map(mapping.get, edge)) for edge in G.edges()]
+        if not G.is_directed():
+            edge_pairs += [[target, source] for source, target in edge_pairs if source != target]
+        edges = torch.tensor(edge_pairs, dtype=torch.long).reshape(-1, 2).t().contiguous()
 
         if G.nodes():
-            sample_features = next(iter(G.nodes(data=True)))[1]
-            feature_keys = list(sample_features.keys())
-            
-            # Determine the maximum length of feature vectors
-            max_length = max(len(node_features) for _, node_features in G.nodes(data=True))
+            if self.feature_keys is None:
+                self.feature_keys = list(next(iter(G.nodes(data=True)))[1])
+            feature_keys = self.feature_keys
+            if len(feature_keys) > self.in_channels:
+                raise ValueError('Feature schema is wider than in_channels')
+            max_length = self.in_channels
         
             features = []
             for _, node_features in G.nodes(data=True):
@@ -148,23 +184,25 @@ class GAEPipeline:
 
     def random_walk(self, graph):
         graph = self.convert_node_labels_to_integers(graph)
-        num_nodes = self.sampling_params.pop('num_nodes', 40000)
-        model = RandomWalkWithRestartSampler(number_of_nodes=num_nodes, **self.sampling_params)
+        params = dict(self.sampling_params)
+        num_nodes = params.pop('num_nodes', 40000)
+        model = RandomWalkWithRestartSampler(number_of_nodes=num_nodes, seed=self.seed, **params)
         new_graph = model.sample(graph)
         self.save_graph_to_pickle(new_graph, f'{self.directory}/sampled_graphs/{self.sampling_method_name}_sampled_graph.pkl')
         return new_graph
 
     def forest_fire(self, graph):
         graph = self.convert_node_labels_to_integers(graph)
-        num_nodes = self.sampling_params.pop('num_nodes', 30000)
-        model = ForestFireSampler(number_of_nodes=num_nodes, **self.sampling_params)
+        params = dict(self.sampling_params)
+        num_nodes = params.pop('num_nodes', 30000)
+        model = ForestFireSampler(number_of_nodes=num_nodes, seed=self.seed, **params)
         new_graph = model.sample(graph)
         self.save_graph_to_pickle(new_graph, f'{self.directory}/sampled_graphs/{self.sampling_method_name}_sampled_graph.pkl')
         return new_graph
 
     def cluster_GCN(self, data):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        torch.manual_seed(12345)
+        device = self.device
+        torch.manual_seed(self.seed)
         cluster_data = ClusterData(data, num_parts=8) 
         loader = ClusterLoader(cluster_data, batch_size=1, shuffle=True)  
         return loader
@@ -185,9 +223,10 @@ class GAEPipeline:
 
     def train(self, graph, epochs=100, batch_size=16):
         print(f"Training with parameters: out_channels={self.out_channels}, hidden_channels={self.hidden_channels}, num_layers={self.num_layers}, dropout_rate={self.dropout_rate}, sampling_method={self.sampling_method_name}")
+        if self.feature_keys is None:
+            self.feature_keys = list(next(iter(graph.nodes(data=True)))[1])
         sampled_subgraph = self.sampling_method(graph)
-        if self.preprocessing:
-            data = self.preprocess_graph(sampled_subgraph)
+        data = self.preprocess_graph(sampled_subgraph) if self.preprocessing else sampled_subgraph
         loader = DataLoader([data], batch_size=batch_size)
         self.model.train()
         losses = []
@@ -208,7 +247,10 @@ class GAEPipeline:
             losses.append(avg_loss)
             print(f'Epoch {epoch+1}, Average Loss: {avg_loss}')
             if epoch == epochs - 1:
-               z_to_save = torch.cat(all_z, dim=0)
+               self.model.eval()
+               with torch.no_grad():
+                   z_to_save = torch.cat([self.model.encode(batch.x.to(self.device), batch.edge_index.to(self.device)).cpu()
+                                          for batch in loader], dim=0)
                torch.save(z_to_save, f'{self.directory}/epoch_{epoch+1}_z_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pt')
         self.plot_learning_curve(losses, f'{self.directory}/learning_curve_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.png')
         torch.save(self.model, f'{self.directory}/model_state_dict_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pth')
@@ -238,7 +280,15 @@ class GAEPipeline:
             losses.append(avg_loss)
             print(f"Epoch {epoch+1}, Average Loss: {avg_loss}")
             if epoch == epochs - 1:
-                final_embeddings = np.concatenate(epoch_embeddings, axis=0)
+                self.model.eval()
+                final_embeddings = np.empty((data.num_nodes, self.out_channels), dtype=np.float32)
+                offset = 0
+                with torch.no_grad():
+                    for part in ClusterLoader(loader.cluster_data, batch_size=1, shuffle=False):
+                        encoded = self.model.encode(part.x.to(self.device), part.edge_index.to(self.device)).cpu().numpy()
+                        node_ids = loader.cluster_data.partition.node_perm[offset:offset + part.num_nodes].numpy()
+                        final_embeddings[node_ids] = encoded
+                        offset += part.num_nodes
         torch.save(torch.from_numpy(final_embeddings), f'{self.directory}/embedding_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pt')
         self.plot_learning_curve(losses, f'{self.directory}/learning_curve_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.png')
         torch.save(self.model, f'{self.directory}/model_state_dict_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pth')
@@ -246,8 +296,7 @@ class GAEPipeline:
         return losses
 
     def train_without_sampling(self, graph, epochs=500, batch_size=32):
-        if self.preprocessing:
-            data = self.preprocess_graph(graph)
+        data = self.preprocess_graph(graph) if self.preprocessing else graph
         loader = DataLoader([data], batch_size=batch_size)
         self.model.train()
         losses = []
@@ -268,7 +317,10 @@ class GAEPipeline:
             losses.append(avg_loss)
             print(f'Epoch {epoch+1}, Average Loss: {avg_loss}')
             if epoch == epochs - 1:
-               z_to_save = torch.cat(all_z, dim=0)
+               self.model.eval()
+               with torch.no_grad():
+                   z_to_save = torch.cat([self.model.encode(batch.x.to(self.device), batch.edge_index.to(self.device)).cpu()
+                                          for batch in loader], dim=0)
                torch.save(z_to_save, f'{self.directory}/without_sampling_epoch_{epoch+1}_z_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pt')
         self.plot_learning_curve(losses, f'{self.directory}/without_sampling_learning_curve_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.png')
         torch.save(self.model, f'{self.directory}/without_sampling_model_state_dict_out_channels_{self.out_channels}_hidden_{self.hidden_channels}_layers_{self.num_layers}_dropout_{self.dropout_rate}.pth')
@@ -335,59 +387,60 @@ def train_with_params(sampling_method, params, in_channels, graph):
                                 print(f"Error during training with clusterGCN: {e}")
     return results
 
-# Load the graph
-pipeline_st = GAEPipeline(in_channels=10, out_channels=32, hidden_channels=50, num_layers=1, dropout_rate=0, sampling_method='random_walk')
-graph = pipeline_st.load_graph_from_pickle('combined_graph_latest.pkl')
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Train a seeded graph autoencoder on bundled data.')
+    parser.add_argument('--graph', type=Path, default=DEFAULT_GRAPH)
+    parser.add_argument('--output-dir', type=Path, default=REPO_ROOT / 'outputs')
+    parser.add_argument('--sampling', choices=['none', 'random_walk', 'forest_fire', 'clusterGCN'], default='none')
+    parser.add_argument('--epochs', type=int, default=2)
+    parser.add_argument('--max-nodes', type=int, default=200, help='Deterministic induced subgraph; 0 uses the full graph.')
+    parser.add_argument('--sample-nodes', type=int, default=100)
+    parser.add_argument('--hidden-channels', type=int, default=60)
+    parser.add_argument('--out-channels', type=int, default=64)
+    parser.add_argument('--num-layers', type=int, default=6)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+    args = parser.parse_args(argv)
+    if args.epochs < 1 or args.max_nodes < 0 or args.num_layers < 2:
+        parser.error('epochs must be positive, max-nodes nonnegative, and num-layers at least 2')
+    seed_everything(args.seed)
+    with open(args.graph, 'rb') as handle:
+        graph = pickle.load(handle)
+    feature_keys = sorted(set().union(*(features.keys() for _, features in graph.nodes(data=True))))
+    if args.max_nodes:
+        graph = graph.subgraph(list(graph.nodes())[:args.max_nodes]).copy()
+    if not graph.number_of_nodes() or not graph.number_of_edges():
+        parser.error('graph must have nodes and edges')
+    if args.sampling == 'random_walk':
+        graph = graph.subgraph(max(nx.connected_components(graph), key=len)).copy()
+    if args.sampling in ('random_walk', 'forest_fire') and not 0 < args.sample_nodes <= graph.number_of_nodes():
+        parser.error('sample-nodes must be positive and no larger than the available graph')
+    in_channels = len(feature_keys)
+    pipeline = GAEPipeline(in_channels=in_channels, out_channels=args.out_channels,
+        hidden_channels=args.hidden_channels, num_layers=args.num_layers,
+        dropout_rate=args.dropout, sampling_method=args.sampling,
+        seed=args.seed, output_dir=args.output_dir, device=args.device, feature_keys=feature_keys,
+        **({'num_nodes': args.sample_nodes} if args.sampling in ('random_walk', 'forest_fire') else {}))
+    if args.sampling == 'none':
+        losses = pipeline.train_without_sampling(graph, epochs=args.epochs)
+    elif args.sampling == 'clusterGCN':
+        losses = pipeline.train_clusterGCN(graph, epochs=args.epochs)
+    else:
+        losses = pipeline.train(graph, epochs=args.epochs)
+    metadata = {**vars(args), 'graph': str(args.graph.resolve()), 'output_dir': str(args.output_dir.resolve()),
+                'nodes': graph.number_of_nodes(), 'edges': graph.number_of_edges(), 'losses': losses, 'feature_keys': feature_keys,
+                'torch_version': torch.__version__, 'numpy_version': np.__version__,
+                'python_version': platform.python_version(),
+                'graph_sha256': hashlib.sha256(args.graph.read_bytes()).hexdigest(),
+                'dependencies': {name: version(name) for name in ['torch-geometric', 'networkx', 'scikit-learn', 'littleballoffur']}}
+    torch.save({'model_state_dict': pipeline.model.state_dict(),
+                'in_channels': in_channels, 'hidden_channels': args.hidden_channels,
+                'out_channels': args.out_channels, 'num_layers': args.num_layers,
+                'dropout_rate': args.dropout, 'seed': args.seed, 'feature_keys': feature_keys}, Path(pipeline.directory, 'checkpoint.pt'))
+    Path(pipeline.directory, 'run.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    return losses
 
-# Determine max_length for in_channels
-max_length = max(len(node_features) for _, node_features in graph.nodes(data=True))
-in_channels = max_length
 
-# Define Parameter Combinations
-random_walk_params = {
-    'out_channels': [64],
-    'hidden_channels': [60],
-    'num_layers': [6],
-    'dropout_rate': [0.2],
-    'p': [0.2],
-    'num_nodes': [10000]
-}
-
-forest_fire_params = {
-    'out_channels': [64],
-    'hidden_channels': [60],
-    'num_layers': [6],
-    'dropout_rate': [0.2],
-    'p': [0.6],
-    'num_nodes': [10000]
-}
-
-cluster_gcn_params = {
-    'out_channels': [64],
-    'hidden_channels': [60],
-    'num_layers': [6],
-    'dropout_rate': [0.2],
-    'num_nodes': [1000]  # Cluster-GCN does not use num_nodes parameter
-}
-
-# # Train with random walk parameters
-# random_walk_results = train_with_params('random_walk', random_walk_params, in_channels, graph)
-
-# # Train with forest fire parameters
-# forest_fire_results = train_with_params('forest_fire', forest_fire_params, in_channels, graph)
-
-# # Train with cluster-GCN parameters
-# cluster_gcn_results = train_with_params('clusterGCN', cluster_gcn_params, in_channels, graph)
-
-# Print results
-# print("Random Walk Results:")
-# for result in random_walk_results:
-#     print(result)
-
-# print("Forest Fire Results:")
-# for result in forest_fire_results:
-#     print(result)
-
-# print("Cluster-GCN Results:")
-# for result in cluster_gcn_results:
-#     print(result)
+if __name__ == '__main__':
+    main()
