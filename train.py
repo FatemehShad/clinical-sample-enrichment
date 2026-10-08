@@ -23,14 +23,39 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_GRAPH = REPO_ROOT / 'data' / 'combined_graph_latest.pkl'
 
 
-def seed_everything(seed):
+def resolve_device(requested=None):
+    """Resolve auto/CPU/CUDA selection before loading data or creating outputs."""
+    if requested is None or str(requested) == 'auto':
+        requested = 'cuda' if torch.cuda.is_available() else 'cpu'
+    try:
+        device = torch.device(requested)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise ValueError('Use cpu, auto, cuda, or cuda:<GPU index>') from exc
+    if device.type not in ('cpu', 'cuda') or (device.type == 'cpu' and device.index is not None):
+        raise ValueError('Use cpu, auto, cuda, or cuda:<GPU index>')
+    if device.type == 'cuda':
+        if not torch.cuda.is_available():
+            raise ValueError('CUDA is unavailable. Install with scripts/setup.sh --gpu on an NVIDIA GPU host with a compatible driver, or use --device cpu.')
+        index = torch.cuda.current_device() if device.index is None else device.index
+        if index >= torch.cuda.device_count():
+            raise ValueError(f'CUDA device {index} is unavailable; detected {torch.cuda.device_count()} GPU(s)')
+        device = torch.device('cuda', index)
+    return device
+
+
+def seed_everything(seed, deterministic=True):
+    # Set before the first CUDA context is initialized. Required by deterministic cuBLAS.
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(deterministic)
     torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 class GCNEncoder(torch.nn.Module):
@@ -62,10 +87,11 @@ class GCNEncoder(torch.nn.Module):
         return x
 
 class GAEPipeline:
-    def __init__(self, in_channels, out_channels, hidden_channels, num_layers, dropout_rate, sampling_method='random_walk', preprocessing=True, seed=42, output_dir=None, device=None, feature_keys=None, **sampling_params):
+    def __init__(self, in_channels, out_channels, hidden_channels, num_layers, dropout_rate, sampling_method='random_walk', preprocessing=True, seed=42, output_dir=None, device=None, feature_keys=None, deterministic=True, **sampling_params):
         self.seed = seed
-        seed_everything(seed)
-        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.deterministic = deterministic
+        seed_everything(seed, deterministic=deterministic)
+        self.device = resolve_device(device)
         self.in_channels = in_channels
         self.feature_keys = list(feature_keys) if feature_keys is not None else None
         self.out_channels = out_channels
@@ -400,11 +426,18 @@ def main(argv=None):
     parser.add_argument('--num-layers', type=int, default=6)
     parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+    parser.add_argument('--device', default='cpu', help='cpu, auto, cuda, or cuda:<GPU index> (e.g. cuda:1)')
+    parser.add_argument('--allow-nondeterministic', action='store_true',
+                        help='Allow CUDA operations without deterministic implementations; results may vary.')
     args = parser.parse_args(argv)
     if args.epochs < 1 or args.max_nodes < 0 or args.num_layers < 2:
         parser.error('epochs must be positive, max-nodes nonnegative, and num-layers at least 2')
-    seed_everything(args.seed)
+    seed_everything(args.seed, deterministic=not args.allow_nondeterministic)
+    try:
+        device = resolve_device(args.device)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(f'Training device: {device}')
     with open(args.graph, 'rb') as handle:
         graph = pickle.load(handle)
     feature_keys = sorted(set().union(*(features.keys() for _, features in graph.nodes(data=True))))
@@ -420,7 +453,7 @@ def main(argv=None):
     pipeline = GAEPipeline(in_channels=in_channels, out_channels=args.out_channels,
         hidden_channels=args.hidden_channels, num_layers=args.num_layers,
         dropout_rate=args.dropout, sampling_method=args.sampling,
-        seed=args.seed, output_dir=args.output_dir, device=args.device, feature_keys=feature_keys,
+        seed=args.seed, output_dir=args.output_dir, device=device, feature_keys=feature_keys, deterministic=not args.allow_nondeterministic,
         **({'num_nodes': args.sample_nodes} if args.sampling in ('random_walk', 'forest_fire') else {}))
     if args.sampling == 'none':
         losses = pipeline.train_without_sampling(graph, epochs=args.epochs)
@@ -431,10 +464,15 @@ def main(argv=None):
     metadata = {**vars(args), 'graph': str(args.graph.resolve()), 'output_dir': str(args.output_dir.resolve()),
                 'nodes': graph.number_of_nodes(), 'edges': graph.number_of_edges(), 'losses': losses, 'feature_keys': feature_keys,
                 'torch_version': torch.__version__, 'numpy_version': np.__version__,
+                'requested_device': args.device, 'device': str(pipeline.device),
+                'cuda_version': torch.version.cuda,
+                'gpu_name': torch.cuda.get_device_name(pipeline.device) if pipeline.device.type == 'cuda' else None,
+                'deterministic': pipeline.deterministic, 'cpu_threads': torch.get_num_threads(),
+                'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
                 'python_version': platform.python_version(),
                 'graph_sha256': hashlib.sha256(args.graph.read_bytes()).hexdigest(),
                 'dependencies': {name: version(name) for name in ['torch-geometric', 'networkx', 'scikit-learn', 'littleballoffur']}}
-    torch.save({'model_state_dict': pipeline.model.state_dict(),
+    torch.save({'model_state_dict': {key: value.detach().cpu() for key, value in pipeline.model.state_dict().items()},
                 'in_channels': in_channels, 'hidden_channels': args.hidden_channels,
                 'out_channels': args.out_channels, 'num_layers': args.num_layers,
                 'dropout_rate': args.dropout, 'seed': args.seed, 'feature_keys': feature_keys}, Path(pipeline.directory, 'checkpoint.pt'))

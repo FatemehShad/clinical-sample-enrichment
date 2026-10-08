@@ -1,17 +1,21 @@
 import json
+import contextlib
+import io
 import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pickle
+from unittest.mock import patch
 import unittest
 
 import networkx as nx
 import numpy as np
 import torch
 
-from train import GAEPipeline, main
+from train import GAEPipeline, main, resolve_device, seed_everything
 from utils_functions import calculate_mutual_info_score, calculate_similarity_matrix
 
 
@@ -118,6 +122,71 @@ class ReproducibilityTests(unittest.TestCase):
             expected = (expected - expected.mean(0)) / expected.std(0)
             np.testing.assert_allclose(data.x.numpy(), expected, rtol=1e-6, atol=1e-6)
             self.assertEqual(data.num_edges, 4)
+
+    def test_device_selection_and_unavailable_cuda(self):
+        with patch('torch.cuda.is_available', return_value=False):
+            self.assertEqual(resolve_device('auto'), torch.device('cpu'))
+            self.assertEqual(resolve_device('cpu'), torch.device('cpu'))
+            with self.assertRaisesRegex(ValueError, 'scripts/setup.sh --gpu'):
+                resolve_device('cuda')
+            with tempfile.TemporaryDirectory() as tmp:
+                with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
+                    main(['--device', 'cuda', '--graph', '/missing/graph.pkl', '--output-dir', tmp])
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('CUDA is unavailable', stderr.getvalue())
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+        with patch('torch.cuda.is_available', return_value=True), patch('torch.cuda.device_count', return_value=2), patch('torch.cuda.current_device', return_value=0):
+            self.assertEqual(resolve_device('auto'), torch.device('cuda:0'))
+            self.assertEqual(resolve_device('cuda:1'), torch.device('cuda:1'))
+            with self.assertRaisesRegex(ValueError, 'detected 2 GPU'):
+                resolve_device('cuda:2')
+        for invalid in ['mps', 'invalid', 'cuda:-1', 'cpu:1']:
+            with self.assertRaises(ValueError):
+                resolve_device(invalid)
+
+    def test_cuda_determinism_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            seed_everything(42)
+            self.assertEqual(os.environ['CUBLAS_WORKSPACE_CONFIG'], ':4096:8')
+            self.assertTrue(torch.are_deterministic_algorithms_enabled())
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            try:
+                seed_everything(42, deterministic=False)
+                self.assertFalse(torch.are_deterministic_algorithms_enabled())
+            finally:
+                seed_everything(42)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'NVIDIA GPU and CUDA-enabled PyTorch are required')
+    def test_gpu_training_and_portable_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            graph_path = Path(tmp) / 'graph.pkl'
+            with graph_path.open('wb') as handle:
+                graph = nx.cycle_graph(80)
+                for node in graph:
+                    graph.nodes[node].update(a=float(node), b=float(node % 3))
+                pickle.dump(graph, handle)
+            sampling_modes = ['none', 'random_walk', 'forest_fire']
+            if importlib.util.find_spec('pyg_lib'):
+                sampling_modes.append('clusterGCN')
+            for sampling in sampling_modes:
+                with self.subTest(sampling=sampling):
+                    states, losses = [], []
+                    for repeat in range(2):
+                        output_dir = Path(tmp) / sampling / str(repeat)
+                        losses.append(main(['--graph', str(graph_path), '--output-dir', str(output_dir),
+                                            '--device', 'cuda:0', '--sampling', sampling, '--epochs', '2',
+                                            '--max-nodes', '0', '--sample-nodes', '10', '--num-layers', '2',
+                                            '--hidden-channels', '8', '--out-channels', '4']))
+                        checkpoint = torch.load(next(output_dir.rglob('checkpoint.pt')), weights_only=True)
+                        states.append(checkpoint['model_state_dict'])
+                        self.assertTrue(all(tensor.device.type == 'cpu' for tensor in states[-1].values()))
+                        metadata = json.loads(next(output_dir.rglob('run.json')).read_text())
+                        self.assertEqual(metadata['device'], 'cuda:0')
+                        self.assertEqual(metadata['cuda_version'], torch.version.cuda)
+                        self.assertIsNotNone(metadata['gpu_name'])
+                    self.assertEqual(losses[0], losses[1])
+                    for key in states[0]:
+                        self.assertTrue(torch.equal(states[0][key], states[1][key]), key)
 
     def test_analysis(self):
         similarity = calculate_similarity_matrix(np.array([[1., 0.], [0., 1.]]))

@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
-case "${1:-}" in
-  ""|--cluster|--cluster-source) ;;
-  *) echo 'Usage: setup.sh [--cluster|--cluster-source]' >&2; exit 2 ;;
-esac
+gpu=0
+cluster=0
+cluster_source=0
+for option in "$@"; do
+  case "$option" in
+    --gpu) gpu=1 ;;
+    --cluster) cluster=1 ;;
+    --cluster-source) cluster_source=1 ;;
+    *) echo 'Usage: setup.sh [--gpu] [--cluster | --cluster-source]' >&2; exit 2 ;;
+  esac
+done
+if (( cluster_source && (gpu || cluster) )); then
+  echo '--cluster-source supports CPU only; use --gpu --cluster for CUDA wheels.' >&2
+  exit 2
+fi
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 venv_dir="${CLINICAL_VENV:-$repo_dir/.venv}"
 uv venv --python 3.8.20 --allow-existing "$venv_dir"
-uv pip sync --python "$venv_dir/bin/python" "$repo_dir/requirements.txt"
-if [[ "${1:-}" == "--cluster" ]]; then
-  # CPU-only binaries match the pinned PyTorch 2.2 ABI.
-  uv pip install --python "$venv_dir/bin/python" pyg-lib==0.4.0 \
-    --find-links https://data.pyg.org/whl/torch-2.2.0+cpu.html --only-binary :all:
+requirements_file="$repo_dir/requirements.txt"
+pyg_variant=cpu
+if (( gpu )); then
+  requirements_file="$repo_dir/requirements-gpu.txt"
+  pyg_variant=cu121
 fi
-if [[ "${1:-}" == "--cluster-source" ]]; then
+uv pip sync --python "$venv_dir/bin/python" "$requirements_file"
+if (( cluster )); then
+  # Extension binaries must match the selected PyTorch 2.2/CUDA ABI.
+  uv pip install --python "$venv_dir/bin/python" pyg-lib==0.4.0 \
+    --find-links "https://data.pyg.org/whl/torch-2.2.0+${pyg_variant}.html" --only-binary :all:
+fi
+if (( cluster_source )); then
   source_dir="${CLINICAL_PYG_SOURCE:-${TMPDIR:-/tmp}/clinical-pyg-lib-0.4.0}"
   source_commit=84d48b5553a10d787c730467d4dc4a35bdc380c5
   if [[ ! -e "$source_dir" ]]; then
