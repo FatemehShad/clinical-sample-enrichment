@@ -19,11 +19,12 @@ export OMP_NUM_THREADS=2
 python -m unittest discover -s tests -v
 ```
 
-`requirements.txt` pins the tested direct and transitive Python dependencies.
+`requirements.txt` and `requirements-gpu.txt` select CPU and CUDA builds;
+`requirements-common.txt` pins their shared direct and transitive dependencies.
 The setup script synchronizes that environment without changing the lockfile.
 `environment.yml` is the original Windows Conda export; its Windows build pins
 and mismatched torchvision version make it unsuitable as a Linux setup recipe.
-GPU training and newer Python versions have not been validated.
+GPU hardware training and newer Python versions have not been validated in the CPU cloud environment.
 
 For **ClusterGCN**, add the matching CPU METIS-enabled extension:
 
@@ -44,6 +45,60 @@ The source build uses two compilation jobs and can take several minutes.
 `CLINICAL_VENV` selects another environment path; `CLINICAL_PYG_SOURCE` selects
 the dependency source cache. A generic
 source build of `torch-sparse` without METIS is insufficient for ClusterGCN.
+
+## NVIDIA GPU setup and training
+
+A CUDA-capable NVIDIA GPU and a driver compatible with CUDA 12.1 are required.
+The GPU environment pins **PyTorch 2.2.2+cu121** and its CUDA runtime dependencies
+for the same Linux x86_64 / Python 3.8.20 platform. The PyTorch wheel includes
+its published SHA-256. GPU training does not require a separate CUDA toolkit.
+
+Use a separate environment to retain the CPU installation:
+
+```bash
+CLINICAL_VENV="$PWD/.venv-gpu" bash scripts/setup.sh --gpu
+source .venv-gpu/bin/activate
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+MPLBACKEND=Agg python train.py --device cuda:0 --epochs 2 --max-nodes 1000 --output-dir outputs/gpu
+```
+
+`--device cuda` selects the current GPU, `--device cuda:1` selects another visible
+GPU, and `--device auto` selects a GPU when available and otherwise uses CPU.
+The CLI defaults to CPU. An explicit CUDA request fails before loading data or
+creating outputs when the CUDA build, GPU, or driver is unavailable. GPU indices
+refer to the devices visible through `CUDA_VISIBLE_DEVICES`.
+
+All training modes move features, edges, and model parameters to the chosen
+device. Graph loading and sampling remain on CPU. For GPU **ClusterGCN**, install
+the matching PyG extension; the CPU source fallback is for CPU environments:
+
+```bash
+CLINICAL_VENV="$PWD/.venv-gpu" bash scripts/setup.sh --gpu --cluster
+source .venv-gpu/bin/activate
+MPLBACKEND=Agg python train.py --device cuda:0 --sampling clusterGCN --max-nodes 1000 --epochs 2 --output-dir outputs/gpu-cluster
+```
+
+Deterministic operations are enabled by default. The code configures cuBLAS
+before CUDA initialization and disables TF32. Restart an existing notebook
+kernel before enabling this mode if it has already initialized CUDA. If a CUDA
+operation has no deterministic implementation, PyTorch reports it; explicitly
+use `--allow-nondeterministic` (or `GAEPipeline(..., deterministic=False)`) to
+allow that operation, accepting that repeated runs may differ. Results are not
+guaranteed identical across different GPUs, drivers, or CPU/GPU backends.
+
+`run.json` records the requested and resolved device, GPU name, CUDA version,
+determinism setting, and cuBLAS configuration. Portable state checkpoints store
+CPU tensors even when training on GPU, so loading them does not require a GPU.
+The GPU dependency installation and CPU fallback checks can be validated on a
+CPU host; actual GPU execution tests are skipped until run on NVIDIA hardware:
+
+```bash
+MPLBACKEND=Agg OMP_NUM_THREADS=2 python -m unittest discover -s tests -v
+```
+
+The GPU test exercises unsampled, random-walk, and forest-fire training twice,
+compares losses and weights, and verifies the saved device and portable weights.
+It also checks ClusterGCN when the optional matching extension is installed.
 
 ## Run training
 
@@ -96,7 +151,7 @@ Specify `--output-dir /path/to/run` to choose another location. Reusing the same
 configuration and output directory replaces that run's artifacts.
 
 Each CLI run records `run.json` with the options, losses, software versions,
-input graph SHA-256, graph size, and ordered feature keys; saves a learning curve and embeddings; and
+input graph SHA-256, graph size, ordered feature keys, and device details; saves a learning curve and embeddings; and
 writes `checkpoint.pt` containing the model state and architecture parameters.
 Saved embeddings use the final model in evaluation mode. ClusterGCN embeddings
 are restored to original graph node order before saving.
