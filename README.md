@@ -6,45 +6,48 @@ NetworkX graph, training code, analysis notebooks, and historical model results.
 
 ## CPU environment
 
-The tested platform is **Linux x86_64, CPython 3.8.20, PyTorch 2.2.2 CPU, and
-PyTorch Geometric 2.5.2**. Install [uv](https://docs.astral.sh/uv/getting-started/installation/),
+CPU and GPU training use the same **`clinical-gpu` Conda environment** on Linux
+x86_64, with CPython 3.8.20, PyTorch 2.2.2+cu121, and PyTorch Geometric 2.5.2.
+The CUDA-enabled PyTorch build also runs on CPU without an NVIDIA GPU or driver.
+Install [Conda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html),
 then run from the repository root:
 
 ```bash
-uv python install 3.8.20
-bash scripts/setup.sh
-source .venv/bin/activate
+conda env create -f environment-gpu.yml
+conda activate clinical-gpu
+python -m pip install -r requirements-gpu.txt
 export MPLBACKEND=Agg
 export OMP_NUM_THREADS=2
+python train.py --device cpu --epochs 2 --max-nodes 200 --output-dir outputs/cpu
 python -m unittest discover -s tests -v
 ```
 
-`requirements.txt` and `requirements-gpu.txt` select CPU and CUDA builds;
-`requirements-common.txt` pins their shared direct and transitive dependencies.
-The setup script synchronizes that environment without changing the lockfile.
-`environment.yml` is the original Windows Conda export; its Windows build pins
-and mismatched torchvision version make it unsuitable as a Linux setup recipe.
-GPU hardware training and newer Python versions have not been validated in the CPU cloud environment.
+Create this environment only once. If it is already installed for GPU training,
+start with `conda activate clinical-gpu` and run training with `--device cpu`;
+there is no need to create another environment or replace PyTorch. Use
+`conda deactivate` to leave the environment.
 
-For **ClusterGCN**, add the matching CPU METIS-enabled extension:
+`environment-gpu.yml` pins the Conda Python and pip bootstrap;
+`requirements-gpu.txt` and `requirements-common.txt` pin the shared environment's
+Python dependencies. CPU execution with this CUDA build was validated on the
+cloud CPU host. GPU hardware execution and newer Python versions have not been
+validated here. `environment.yml` is the original Windows export; use
+`environment-gpu.yml` for this shared Linux environment.
 
-```bash
-bash scripts/setup.sh --cluster
-```
-
-This requires HTTPS access to `data.pyg.org`. Regular graph convolution, random
-walk sampling, and forest fire sampling do not require this extension. When the wheel host is unavailable, a tested Linux source fallback uses a C++
-compiler, the locked CMake/Ninja tools, and the pinned official pyg-lib commit
-with its pinned METIS submodules:
+For **ClusterGCN** on CPU, install the extension matching the shared environment's
+CUDA-enabled PyTorch build. The same extension is used for GPU training:
 
 ```bash
-bash scripts/setup.sh --cluster-source
+conda activate clinical-gpu
+python -m pip install --no-deps --only-binary=:all: pyg-lib==0.4.0 \
+  --find-links https://data.pyg.org/whl/torch-2.2.0+cu121.html
+MPLBACKEND=Agg python train.py --device cpu --sampling clusterGCN --max-nodes 1000 --epochs 2 --output-dir outputs/cpu-cluster
 ```
 
-The source build uses two compilation jobs and can take several minutes.
-`CLINICAL_VENV` selects another environment path; `CLINICAL_PYG_SOURCE` selects
-the dependency source cache. A generic
-source build of `torch-sparse` without METIS is insufficient for ClusterGCN.
+The optional extension requires HTTPS access to `data.pyg.org`. Unsampled,
+random-walk, and forest-fire training do not require it. On hosts without an
+NVIDIA GPU, the hardware-dependent GPU test is skipped; the optional ClusterGCN
+test is also skipped until its extension is installed.
 
 ## NVIDIA GPU setup and training
 
@@ -54,23 +57,13 @@ for the same Linux x86_64 / Python 3.8.20 platform. The PyTorch wheel includes
 its published SHA-256. `environment-gpu.yml` pins the Conda bootstrap;
 `requirements-gpu.txt` pins the Python package installation. GPU training does not require a separate CUDA toolkit.
 
-Install [Conda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html)
-and create the dedicated GPU environment from the repository root. Conda
-provides the pinned Python and pip versions; pip installs the same pinned
-CUDA-enabled PyTorch and scientific dependencies:
+Use the shared `clinical-gpu` environment created in the CPU setup above:
 
 ```bash
-conda env create -f environment-gpu.yml
 conda activate clinical-gpu
-python -m pip install -r requirements-gpu.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 MPLBACKEND=Agg python train.py --device cuda:0 --epochs 2 --max-nodes 1000 --output-dir outputs/gpu
 ```
-
-If `clinical-gpu` already exists, use `conda activate clinical-gpu` and rerun
-the pip installation instead of creating it again. To leave it, run
-`conda deactivate`. The legacy `environment.yml` remains the original Windows
-export; use `environment-gpu.yml` for this Linux GPU workflow.
 
 `--device cuda` selects the current GPU, `--device cuda:1` selects another visible
 GPU, and `--device auto` selects a GPU when available and otherwise uses CPU.
@@ -79,8 +72,8 @@ creating outputs when the CUDA build, GPU, or driver is unavailable. GPU indices
 refer to the devices visible through `CUDA_VISIBLE_DEVICES`.
 
 All training modes move features, edges, and model parameters to the chosen
-device. Graph loading and sampling remain on CPU. For GPU **ClusterGCN**, install
-the matching PyG extension; the CPU source fallback is for CPU environments:
+device. Graph loading and sampling remain on CPU. For GPU **ClusterGCN**, use
+the same matching PyG extension as in the CPU setup:
 
 ```bash
 conda activate clinical-gpu
