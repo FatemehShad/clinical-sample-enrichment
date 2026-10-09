@@ -4,7 +4,7 @@ Graph autoencoder experiments linking clinical protein expression data to mouse
 Reactome pathways. The repository includes the expression table, a prepared
 NetworkX graph, training code, analysis notebooks, and historical model results.
 
-## Reproducible CPU environment
+## CPU environment
 
 The tested platform is **Linux x86_64, CPython 3.8.20, PyTorch 2.2.2 CPU, and
 PyTorch Geometric 2.5.2**. Install [uv](https://docs.astral.sh/uv/getting-started/installation/),
