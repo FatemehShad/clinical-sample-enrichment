@@ -51,16 +51,26 @@ source build of `torch-sparse` without METIS is insufficient for ClusterGCN.
 A CUDA-capable NVIDIA GPU and a driver compatible with CUDA 12.1 are required.
 The GPU environment pins **PyTorch 2.2.2+cu121** and its CUDA runtime dependencies
 for the same Linux x86_64 / Python 3.8.20 platform. The PyTorch wheel includes
-its published SHA-256. GPU training does not require a separate CUDA toolkit.
+its published SHA-256. `environment-gpu.yml` pins the Conda bootstrap;
+`requirements-gpu.txt` pins the Python package installation. GPU training does not require a separate CUDA toolkit.
 
-Use a separate environment to retain the CPU installation:
+Install [Conda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/index.html)
+and create the dedicated GPU environment from the repository root. Conda
+provides the pinned Python and pip versions; pip installs the same pinned
+CUDA-enabled PyTorch and scientific dependencies:
 
 ```bash
-CLINICAL_VENV="$PWD/.venv-gpu" bash scripts/setup.sh --gpu
-source .venv-gpu/bin/activate
+conda env create -f environment-gpu.yml
+conda activate clinical-gpu
+python -m pip install -r requirements-gpu.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 MPLBACKEND=Agg python train.py --device cuda:0 --epochs 2 --max-nodes 1000 --output-dir outputs/gpu
 ```
+
+If `clinical-gpu` already exists, use `conda activate clinical-gpu` and rerun
+the pip installation instead of creating it again. To leave it, run
+`conda deactivate`. The legacy `environment.yml` remains the original Windows
+export; use `environment-gpu.yml` for this Linux GPU workflow.
 
 `--device cuda` selects the current GPU, `--device cuda:1` selects another visible
 GPU, and `--device auto` selects a GPU when available and otherwise uses CPU.
@@ -73,8 +83,9 @@ device. Graph loading and sampling remain on CPU. For GPU **ClusterGCN**, instal
 the matching PyG extension; the CPU source fallback is for CPU environments:
 
 ```bash
-CLINICAL_VENV="$PWD/.venv-gpu" bash scripts/setup.sh --gpu --cluster
-source .venv-gpu/bin/activate
+conda activate clinical-gpu
+python -m pip install --no-deps --only-binary=:all: pyg-lib==0.4.0 \
+  --find-links https://data.pyg.org/whl/torch-2.2.0+cu121.html
 MPLBACKEND=Agg python train.py --device cuda:0 --sampling clusterGCN --max-nodes 1000 --epochs 2 --output-dir outputs/gpu-cluster
 ```
 
